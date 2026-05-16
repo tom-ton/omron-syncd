@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omron-syncd"
+version = "0.1.0"
+description = "Auto-sync daemon for Omron BP monitors via the omblepy fork"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tom-ton" }]
+dependencies = [
+    # We use BleakScanner with detection_callback, scanning_mode="active",
+    # adapter=..., and AdvertisementData.{manufacturer_data,rssi}. All of
+    # these are stable since bleak 0.20. Cap below the next major in case
+    # of future API breaks.
+    "bleak>=0.20,<1.0",
+]
+
+[project.scripts]
+omron-syncd = "omron_syncd.daemon:main"
+
+[tool.setuptools.packages.find]
+include = ["omron_syncd*"]

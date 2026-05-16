@@ -1,0 +1,60 @@
+[Unit]
+Description=Auto-sync daemon for Omron BP monitor (omblepy)
+Documentation=file:///opt/omron-syncd/README.md
+After=bluetooth.target network.target
+Wants=bluetooth.target
+
+# Rate-limit restart attempts so a pathological crash loop doesn't drown
+# journald. These keys belong in [Unit] — systemd silently ignores them
+# (with a parser warning) if placed in [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# Run as the same user that owns the BlueZ bond directory under
+# /var/lib/bluetooth/<adapter>/<device>/. By default that's root; if you
+# moved bonding to a less-privileged user, change this to that user.
+User=root
+Group=root
+
+# === Required ===
+Environment=OMRON_SYNCD_MAC=F1:95:48:45:81:6B
+Environment=OMRON_SYNCD_DRIVER=HEM-7380T1-EBK
+
+# === Paths ===
+Environment=OMRON_SYNCD_OMBLEPY_DIR=/opt/omblepy
+Environment=OMRON_SYNCD_PYTHON=/opt/omron-syncd/.venv/bin/python3
+Environment=OMRON_SYNCD_OUTPUT_DIR=/var/lib/omron-bp
+Environment=OMRON_SYNCD_LOCK=/run/omron-syncd.lock
+
+# === Tunables (defaults shown; uncomment to change) ===
+#Environment=OMRON_SYNCD_DEBOUNCE=2
+#Environment=OMRON_SYNCD_MIN_INTERVAL=60
+#Environment=OMRON_SYNCD_BACKOFF=5,30,120,300,900
+#Environment=OMRON_SYNCD_TIME_SYNC_INTERVAL=86400
+#Environment=OMRON_SYNCD_SYNC_TIMEOUT=180
+#Environment=OMRON_SYNCD_LOG_LEVEL=INFO
+#Environment=OMRON_SYNCD_ADAPTER=hci0
+
+ExecStart=/opt/omron-syncd/.venv/bin/python3 -m omron_syncd
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening — relax if you need to debug.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/omron-bp /run
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target
