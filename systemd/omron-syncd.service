@@ -37,10 +37,36 @@ Environment=OMRON_SYNCD_LOCK=/run/omron-syncd.lock
 #Environment=OMRON_SYNCD_LOG_LEVEL=INFO
 #Environment=OMRON_SYNCD_ADAPTER=hci0
 
+# Defensive HCI bounce before every start.
+#
+# BlueZ's discovery state machine can wedge (e.g. when a previous
+# omblepy connection was interrupted mid-flight, or a previous daemon
+# instance was SIGKILLed before its scanner cleanup ran). In that
+# state, StartDiscovery returns org.bluez.Error.InProgress on every
+# attempt — *even with no client holding a scan* and even after the
+# adapter reports Discovering: no. Empirically only a power-cycle of
+# the controller (`hciconfig hci0 down/up`) clears it.
+#
+# Doing this on every start is heavy-handed but cheap (~3s) and turns
+# "did the previous run leave BlueZ wedged?" from a question into a
+# non-issue. It's the right trade-off for an always-on daemon you
+# want to "just work" after systemctl restart, a crash, or a reboot.
+#
+# If you're using a non-default adapter, change hci0 here AND set
+# OMRON_SYNCD_ADAPTER above to match.
+ExecStartPre=/usr/bin/hciconfig hci0 down
+ExecStartPre=/bin/sleep 1
+ExecStartPre=/usr/bin/hciconfig hci0 up
+ExecStartPre=/bin/sleep 1
+
 ExecStart=/opt/omron-syncd/.venv/bin/python3 -m omron_syncd
 
 Restart=on-failure
 RestartSec=5
+
+# Bound shutdown so a stuck scanner-stop / hung omblepy subprocess
+# doesn't keep systemd waiting the default 90s before SIGKILL.
+TimeoutStopSec=15
 
 # Hardening — relax if you need to debug.
 NoNewPrivileges=true

@@ -12,10 +12,13 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional
 
 from .config import Config
 from .scanner import TriggerEvent
+
+if TYPE_CHECKING:
+    from .google_sync import CsvToGoogleSheetsSyncer
 
 
 class SyncResult(enum.Enum):
@@ -72,8 +75,13 @@ class SyncWorker:
     the scanner's trigger logic can apply correct backoff.
     """
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        google_syncer: Optional["CsvToGoogleSheetsSyncer"] = None,
+    ):
         self._config = config
+        self._google_syncer = google_syncer
         self._loop_lock = asyncio.Lock()
         self._last_attempt_ts: float = 0.0
         self._last_success_ts: float = 0.0
@@ -117,6 +125,17 @@ class SyncWorker:
         if self._config.time_sync_interval_s <= 0:
             return False
         return (now - self._last_time_sync_ts) >= self._config.time_sync_interval_s
+
+    async def _push_to_google_if_enabled(self) -> None:
+        """Run the Google Sheets sync, if configured. Called OUTSIDE the
+        BLE locks (both ``_loop_lock`` and the file flock) so a slow
+        Google API call doesn't keep BLE coordination locks held.
+        ``CsvToGoogleSheetsSyncer.sync_all`` already isolates per-user
+        failures, so this never raises.
+        """
+        if self._google_syncer is None:
+            return
+        await self._google_syncer.sync_all()
 
     async def trigger(self, evt: TriggerEvent) -> None:
         """Entry point called from scanner. Applies rate-limit, then
@@ -182,6 +201,12 @@ class SyncWorker:
                     except Exception:  # noqa: BLE001
                         logger.exception("on_failure callback raised")
 
+        # Google Sheets push lives OUTSIDE _loop_lock and the file flock
+        # so that a slow HTTPS round-trip doesn't block the next BLE
+        # trigger or stall any manual omblepy.py invocation.
+        if result is SyncResult.OK:
+            await self._push_to_google_if_enabled()
+
     async def do_full_sync(self) -> SyncResult:
         """One-off full sync (omblepy without -n), invoked at daemon
         startup when no output CSVs are present. Reads all 100
@@ -218,7 +243,11 @@ class SyncWorker:
                     "will retry on the next adv burst",
                     self._fail_streak,
                 )
-            return result
+
+        # Mirror trigger(): Google push happens outside the BLE locks.
+        if result is SyncResult.OK:
+            await self._push_to_google_if_enabled()
+        return result
 
     async def _run_omblepy(
         self, *, time_sync: bool, incremental: bool

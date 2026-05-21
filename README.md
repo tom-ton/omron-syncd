@@ -19,6 +19,8 @@ to do the actual sync. All BLE protocol logic lives in `omblepy`.
 - v1: scanner + debouncer + subprocess sync worker, file-locked, with
   exponential-ish failure backoff and an opportunistic daily time-sync
   piggy-back.
+- Optional [Google Sheets sync](#google-sheets-sync-optional) for
+  pushing each user's CSV to a per-user spreadsheet.
 - Tested device: Omron HEM-7380T1-EBK (M7 Intelli IT AFib, EU SKU).
 - Other Omron devices supported by `omblepy` likely also work; just set
   `OMRON_SYNCD_DRIVER` to the right driver name and double-check that
@@ -43,6 +45,13 @@ to do the actual sync. All BLE protocol logic lives in `omblepy`.
                                        └───────┬──────────────────┘
                                                │
                                        user{1,2}.csv / .json
+                                               │
+                                  (after locks release, on OK)
+                                               ▼
+                                       ┌──────────────────────────┐
+                                       │ CsvToGoogleSheetsSyncer  │
+                                       │  (per-user, optional)    │
+                                       └──────────────────────────┘
 ```
 
 On the very first start (no CSVs in the output dir) the SyncWorker runs
@@ -106,6 +115,86 @@ decision.
 
 Failed syncs apply exponential-ish backoff at the sync-worker level
 and re-arm the debouncer so the next adv burst can retrigger.
+
+### Google Sheets sync (optional)
+
+After every successful omblepy run, the daemon can append the new rows
+of each per-user CSV to a Google Sheets worksheet. This is opt-in via
+`OMRON_SYNCD_GSHEETS_ENABLED=true`; if unset (the default) the daemon
+never instantiates the syncer or talks to any Google API. The
+`google-api-python-client` / `google-auth` deps themselves are
+unconditional `pyproject.toml` requirements — keeping them out of the
+import graph isn't worth the optional-extras complexity for a
+single-Pi daemon.
+
+Design points worth knowing:
+
+- **One spreadsheet per user, one service account per user.** Per-user
+  config is fully independent so you can share a sheet with each user
+  separately without leaking other users' data.
+- **Incremental, append-only.** Per-user state files
+  (`<output_dir>/google-sync-<user>.json`) record the latest `datetime`
+  pushed; subsequent runs append only rows newer than that.
+  Append-then-save ordering means a state-save failure after a
+  successful append produces duplicate rows on the next run (easy to
+  spot/clean) rather than silent data loss.
+- **Runs OUTSIDE the BLE locks.** The Google API call happens after
+  `omblepy` has exited and both the asyncio loop lock and the file
+  flock have been released. A slow HTTPS round-trip therefore cannot
+  block the next adv-driven sync or a manual `omblepy.py` invocation.
+- **One `GoogleSheetsClient` per user, cached for the daemon's
+  lifetime.** Service-account OAuth tokens auto-refresh, so long-lived
+  instances are safe and avoid re-parsing the SA JSON on every sync.
+- **Per-user failures are isolated.** An exception while syncing
+  user1 doesn't stop user2 from being attempted in the same cycle.
+
+### Setting up Google Sheets sync
+
+1. **Create a Google Cloud project** (or reuse one). Enable the
+   "Google Sheets API" under APIs & Services.
+2. **Create a service account** under IAM & Admin → Service Accounts,
+   give it no roles, then under "Keys" generate a JSON key. Save the
+   JSON file somewhere only root can read on the Pi, e.g.
+   `/etc/omron-syncd/user1-sa.json`. Lock down permissions:
+
+   ```bash
+   sudo install -d -m 0700 -o root -g root /etc/omron-syncd
+   sudo install -m 0600 -o root -g root user1-sa.json /etc/omron-syncd/
+   ```
+3. **Create the spreadsheet** in Google Sheets and copy its ID from
+   the URL (`https://docs.google.com/spreadsheets/d/<ID>/edit`). The
+   first row should be headers: `datetime, dia, sys, bpm, mov, ihb`.
+4. **Share the spreadsheet** with the service account's email
+   (something like `name@project.iam.gserviceaccount.com`), as
+   "Editor". Repeat for each user.
+5. **Set the env vars** in the systemd unit (see
+   `systemd/omron-syncd.service` for the commented template). Minimal
+   example for one user:
+
+   ```
+   Environment=OMRON_SYNCD_GSHEETS_ENABLED=true
+   Environment=OMRON_SYNCD_GSHEETS_USERS=user1
+   Environment=OMRON_SYNCD_GSHEETS_USER1_CSV=user1.csv
+   Environment=OMRON_SYNCD_GSHEETS_USER1_SPREADSHEET_ID=1abc...
+   Environment=OMRON_SYNCD_GSHEETS_USER1_WORKSHEET=Sheet1
+   Environment=OMRON_SYNCD_GSHEETS_USER1_SA_JSON=/etc/omron-syncd/user1-sa.json
+   ```
+6. **Reload + restart.** `sudo systemctl daemon-reload && sudo
+   systemctl restart omron-syncd`. The next successful sync logs
+   `Syncing N rows to Google Sheets for user user1` followed by
+   `Google Sheets sync completed for user user1`.
+
+### Re-syncing existing rows to Google Sheets
+
+If you ever need to re-push everything (sheet was wiped, or you
+changed worksheet), stop the daemon, delete the state file, and start
+again — the next sync will treat every row as "new":
+
+```bash
+sudo systemctl stop omron-syncd
+sudo rm /var/lib/omron-bp/google-sync-user1.json
+sudo systemctl start omron-syncd
+```
 
 ## Install (Raspberry Pi)
 
@@ -212,6 +301,21 @@ All knobs are environment variables, set in the systemd unit
 | `OMRON_SYNCD_LOG_LEVEL` | `INFO` | DEBUG / INFO / WARNING / ERROR. |
 | `OMRON_SYNCD_LIB_LOG_LEVEL` | `WARNING` | Level clamp for noisy library loggers (bleak, dbus_fast, asyncio). Bump to DEBUG only when debugging bleak itself. |
 
+### Google Sheets sync (only read if `OMRON_SYNCD_GSHEETS_ENABLED=true`)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OMRON_SYNCD_GSHEETS_ENABLED` | `false` | Master switch for the Google Sheets uploader. |
+| `OMRON_SYNCD_GSHEETS_USERS` | _(empty)_ | Comma-separated list of user names that map to the per-user blocks below, e.g. `user1,user2`. |
+| `OMRON_SYNCD_GSHEETS_<USER>_CSV` | _(required)_ | CSV filename relative to `OMRON_SYNCD_OUTPUT_DIR`, e.g. `user1.csv`. |
+| `OMRON_SYNCD_GSHEETS_<USER>_SPREADSHEET_ID` | _(required)_ | The `<ID>` from `docs.google.com/spreadsheets/d/<ID>/edit`. |
+| `OMRON_SYNCD_GSHEETS_<USER>_WORKSHEET` | `Sheet1` | Worksheet (tab) name inside the spreadsheet. |
+| `OMRON_SYNCD_GSHEETS_<USER>_SA_JSON` | _(required)_ | Absolute path to the service-account JSON key with edit access to the spreadsheet. |
+
+State files (`<output_dir>/google-sync-<user>.json`) are managed by
+the daemon — don't hand-edit unless you want to force re-upload (see
+[Re-syncing existing rows to Google Sheets](#re-syncing-existing-rows-to-google-sheets)).
+
 ## Failure modes
 
 | Symptom in log | Likely cause | What to do |
@@ -221,6 +325,8 @@ All knobs are environment variables, set in the systemd unit
 | `lock ... held by another process` | A manual `omblepy.py` is running. | Expected; daemon will pick up on next adv burst. |
 | `omblepy timed out after 180s` | BLE link stalled mid-transfer. | Daemon backs off and retries. Investigate adapter health if frequent. |
 | `omblepy: ... endTransmission status: 0xe5` | Should not happen on the current EBK driver — indicates a regression in the settings-write payload size. | Investigate the driver; do not ignore. |
+| `BleakDBusError: [org.bluez.Error.InProgress] Operation already in progress` at scanner start | BlueZ discovery state machine wedged from a previous interrupted operation (omblepy connect aborted, daemon SIGKILLed, etc.). The systemd unit's `ExecStartPre=hciconfig hci0 down/up` lines normally clear this automatically before every start; if it persists, bluetoothd itself is stuck. | `sudo systemctl restart bluetooth`, then `sudo systemctl restart omron-syncd`. |
+| `Google Sheets sync failed for user ...` | API outage, permissions changed, or sheet/worksheet renamed/deleted. | Daemon logs the exception traceback; the next successful omblepy sync will retry. State file is only advanced on a successful append, so no rows are lost. |
 
 ## Repository layout
 
@@ -234,7 +340,13 @@ omron-syncd/
 │   ├── config.py       – env-driven dataclass
 │   ├── scanner.py      – BleakScanner + adv decoder + debouncer
 │   ├── sync_worker.py  – subprocess + flock + backoff
-│   └── daemon.py       – wires it all together, signal handling
+│   ├── daemon.py       – wires it all together, signal handling
+│   └── google_sync/    – optional CSV → Google Sheets uploader
+│       ├── __init__.py
+│       ├── config.py   – env-driven per-user dataclasses
+│       ├── client.py   – thin googleapiclient wrapper
+│       ├── state.py    – per-user "last datetime synced" JSON store
+│       └── syncer.py   – CSV diff + append + state update
 └── systemd/
     └── omron-syncd.service
 ```
@@ -268,3 +380,26 @@ omron-syncd/
   `OMRON_SYNCD_LIB_LOG_LEVEL`) because at DEBUG they emit one D-Bus
   signal log per BLE adv from any device the adapter sees, which
   drowns our own debug output.
+- The systemd unit unconditionally bounces `hci0` (down/sleep/up) in
+  `ExecStartPre` before launching the daemon. This costs ~3 s but
+  makes startup bulletproof against the BlueZ "discovery wedged"
+  state that follows an interrupted omblepy connect or a SIGKILLed
+  previous instance (see the failure-modes table for the specific
+  error). The in-process retry in `scanner._start_with_retry` is a
+  belt-and-braces complement that handles the much narrower DBus
+  disconnect race when systemd restarts the unit faster than BlueZ
+  can release the previous connection.
+- The Google Sheets push is awaited (not fire-and-forget) but happens
+  outside both BLE locks. Awaiting gives natural backpressure: if the
+  Sheets API is slow or failing, you get one queued upload per sync
+  rather than an unbounded fan-out of background tasks. The daemon
+  isn't slowed by Sheets latency in any meaningful way because the
+  scanner keeps running and the BLE locks are already released.
+- `sync_worker.py` imports the `CsvToGoogleSheetsSyncer` type only
+  under `TYPE_CHECKING`; at runtime it just holds an opaque optional
+  object passed in by the daemon. The intent isn't to skip the
+  `googleapiclient` import (it's a hard dep — see above) but to keep
+  the worker module decoupled and importable in isolation. The
+  syncer is only constructed when `OMRON_SYNCD_GSHEETS_ENABLED=true`,
+  so an API misconfiguration on a disabled feature can never crash
+  the daemon at startup.

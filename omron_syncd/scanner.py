@@ -20,8 +20,19 @@ from typing import Awaitable, Callable, Optional
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakDBusError
 
 from .config import Config
+
+
+# BlueZ takes a moment to process the DBus disconnect after the previous
+# daemon instance exits. A quick restart (e.g. manual `systemctl restart`,
+# which doesn't honour RestartSec) can race that grace period and see the
+# stale scan registration as "still in progress". Retry a handful of times
+# with exponential backoff before giving up; total worst-case wait below
+# is 31s, less than systemd's default TimeoutStartSec.
+_SCAN_START_RETRY_DELAYS_S = (1.0, 2.0, 4.0, 8.0, 16.0)
+_DBUS_ERR_IN_PROGRESS = "org.bluez.Error.InProgress"
 
 
 logger = logging.getLogger("omron-syncd.scanner")
@@ -249,7 +260,11 @@ class AdvScanner:
             self._config.manufacturer_id,
         )
         self._scanner = BleakScanner(**kwargs)
-        await self._scanner.start()
+        await self._start_with_retry(stop_event)
+        if stop_event.is_set():
+            # Shutdown signalled while we were still trying to start.
+            self._scanner = None
+            return
         try:
             await stop_event.wait()
         finally:
@@ -259,3 +274,43 @@ class AdvScanner:
             except Exception:  # noqa: BLE001
                 logger.exception("scanner stop raised")
             self._scanner = None
+
+    async def _start_with_retry(self, stop_event: asyncio.Event) -> None:
+        """Call ``self._scanner.start()`` with retries on the BlueZ
+        "InProgress" race (see comment on ``_SCAN_START_RETRY_DELAYS_S``).
+        All other exceptions propagate immediately. Shutdown signals
+        interrupt the backoff so we don't pointlessly wait out the full
+        retry window when systemd is trying to stop us.
+        """
+        for attempt, delay in enumerate(_SCAN_START_RETRY_DELAYS_S, start=1):
+            try:
+                await self._scanner.start()
+                if attempt > 1:
+                    logger.info(
+                        "BLE scanner started on attempt %d", attempt
+                    )
+                return
+            except BleakDBusError as e:
+                err_name = getattr(e, "dbus_error", None)
+                if err_name != _DBUS_ERR_IN_PROGRESS:
+                    raise
+                logger.warning(
+                    "BlueZ reports a scan already in progress "
+                    "(attempt %d/%d); retrying in %.0fs. Usually means "
+                    "BlueZ hasn't yet released the previous instance's "
+                    "scan registration.",
+                    attempt,
+                    len(_SCAN_START_RETRY_DELAYS_S),
+                    delay,
+                )
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                else:
+                    logger.info(
+                        "shutdown signalled during scanner start retry"
+                    )
+                    return
+        # Out of retries — one last attempt; let whatever error escapes.
+        await self._scanner.start()

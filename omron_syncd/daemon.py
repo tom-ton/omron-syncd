@@ -12,6 +12,10 @@ import signal
 import sys
 
 from .config import Config
+from .google_sync import (
+    CsvToGoogleSheetsSyncer,
+    load_google_sheets_config,
+)
 from .scanner import AdvScanner, TriggerEvent
 from .sync_worker import SyncResult, SyncWorker
 
@@ -106,13 +110,27 @@ async def _amain() -> int:
     config = Config.from_env()
     _setup_logging(config.log_level)
 
+    # Google Sheets sync is opt-in. The syncer is created up-front so the
+    # worker can call it from the OK branch of any sync without conditional
+    # plumbing.
+    google_syncer = None
+    google_cfg = load_google_sheets_config(output_dir=config.output_dir)
+    if google_cfg.enabled:
+        # State lives next to the CSVs so a single output_dir is the only
+        # path the daemon writes user data to. The state file name is
+        # daemon-private and not surfaced to the user.
+        google_syncer = CsvToGoogleSheetsSyncer(
+            config=google_cfg,
+            state_dir=config.output_dir,
+        )
+
     logger.info(
         "omron-syncd starting (mac=%s driver=%s output=%s omblepy=%s)",
         config.device_mac, config.device_driver,
         config.output_dir, config.omblepy_dir,
     )
 
-    worker = SyncWorker(config)
+    worker = SyncWorker(config=config, google_syncer=google_syncer)
     stop_event = asyncio.Event()
 
     async def _on_trigger(evt: TriggerEvent) -> None:

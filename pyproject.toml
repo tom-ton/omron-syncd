@@ -16,6 +16,13 @@ dependencies = [
     # these are stable since bleak 0.20. Cap below the next major in case
     # of future API breaks.
     "bleak>=0.20,<1.0",
+    # Optional Google Sheets integration. We use a small, stable subset:
+    # service_account.Credentials.from_service_account_file (google-auth)
+    # and discovery.build(...).spreadsheets().values().append (google-api-
+    # python-client). Cap below the next major to guard against breaking
+    # API changes (Google have shipped major bumps before).
+    "google-api-python-client>=2.0.0,<3.0.0",
+    "google-auth>=2.0.0,<3.0.0",
 ]
 
 [project.scripts]
